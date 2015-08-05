@@ -26,6 +26,7 @@
 #include <tee_shm.h>
 #include <tee_supp_com.h>
 #include <tee_mutex_wait.h>
+#include <tee_wait_queue.h>
 
 #include <arm_common/teesmc.h>
 #include <arm_common/teesmc_st.h>
@@ -142,6 +143,44 @@ bad:
 	arg32->ret = TEEC_ERROR_BAD_PARAMETERS;
 }
 
+static void handle_rpc_func_cmd_wait_queue(struct tee_tz *ptee,
+						struct teesmc32_arg *arg32)
+{
+	struct teesmc32_param *params;
+
+	if (arg32->num_params != 2)
+		goto bad;
+
+	params = TEESMC32_GET_PARAMS(arg32);
+
+	if ((params[0].attr & TEESMC_ATTR_TYPE_MASK) !=
+			TEESMC_ATTR_TYPE_VALUE_INPUT)
+		goto bad;
+	if ((params[1].attr & TEESMC_ATTR_TYPE_MASK) !=
+			TEESMC_ATTR_TYPE_NONE)
+		goto bad;
+
+	switch (arg32->cmd) {
+	case TEE_RPC_WAIT_QUEUE_SLEEP:
+		tee_wait_queue_sleep(DEV, &ptee->wait_queue,
+				     params[0].u.value.a);
+		break;
+	case TEE_RPC_WAIT_QUEUE_WAKEUP:
+		tee_wait_queue_wakeup(DEV, &ptee->wait_queue,
+				      params[0].u.value.a);
+		break;
+	default:
+		goto bad;
+	}
+
+	arg32->ret = TEEC_SUCCESS;
+	return;
+bad:
+	arg32->ret = TEEC_ERROR_BAD_PARAMETERS;
+}
+
+
+
 static void handle_rpc_func_cmd_wait(struct teesmc32_arg *arg32)
 {
 	struct teesmc32_param *params;
@@ -189,18 +228,20 @@ static void handle_rpc_func_cmd_to_supplicant(struct tee_tz *ptee,
 	inv.res = TEEC_ERROR_NOT_IMPLEMENTED;
 	inv.nbr_bf = arg32->num_params;
 	for (n = 0; n < arg32->num_params; n++) {
-		inv.cmds[n].buffer =
-			(void *)(uintptr_t)params[n].u.memref.buf_ptr;
-		inv.cmds[n].size = params[n].u.memref.size;
 		switch (params[n].attr & TEESMC_ATTR_TYPE_MASK) {
 		case TEESMC_ATTR_TYPE_VALUE_INPUT:
-		case TEESMC_ATTR_TYPE_VALUE_OUTPUT:
 		case TEESMC_ATTR_TYPE_VALUE_INOUT:
+			inv.cmds[n].fd = (int)params[n].u.value.a;
+			/* Fall through */
+		case TEESMC_ATTR_TYPE_VALUE_OUTPUT:
 			inv.cmds[n].type = TEE_RPC_VALUE;
 			break;
 		case TEESMC_ATTR_TYPE_MEMREF_INPUT:
 		case TEESMC_ATTR_TYPE_MEMREF_OUTPUT:
 		case TEESMC_ATTR_TYPE_MEMREF_INOUT:
+			inv.cmds[n].buffer =
+				(void *)(uintptr_t)params[n].u.memref.buf_ptr;
+			inv.cmds[n].size = params[n].u.memref.size;
 			inv.cmds[n].type = TEE_RPC_BUFFER;
 			break;
 		default:
@@ -216,9 +257,6 @@ static void handle_rpc_func_cmd_to_supplicant(struct tee_tz *ptee,
 
 	for (n = 0; n < arg32->num_params; n++) {
 		switch (params[n].attr & TEESMC_ATTR_TYPE_MASK) {
-		case TEESMC_ATTR_TYPE_VALUE_INPUT:
-		case TEESMC_ATTR_TYPE_VALUE_OUTPUT:
-		case TEESMC_ATTR_TYPE_VALUE_INOUT:
 		case TEESMC_ATTR_TYPE_MEMREF_OUTPUT:
 		case TEESMC_ATTR_TYPE_MEMREF_INOUT:
 			/*
@@ -230,6 +268,10 @@ static void handle_rpc_func_cmd_to_supplicant(struct tee_tz *ptee,
 			params[n].u.memref.buf_ptr =
 					(uint32_t)(uintptr_t)inv.cmds[n].buffer;
 			params[n].u.memref.size = inv.cmds[n].size;
+			break;
+		case TEESMC_ATTR_TYPE_VALUE_OUTPUT:
+		case TEESMC_ATTR_TYPE_VALUE_INOUT:
+			params[n].u.value.a = inv.cmds[n].fd;
 			break;
 		default:
 			break;
@@ -248,6 +290,10 @@ static void handle_rpc_func_cmd(struct tee_tz *ptee, u32 parg32)
 	switch (arg32->cmd) {
 	case TEE_RPC_MUTEX_WAIT:
 		handle_rpc_func_cmd_mutex_wait(ptee, arg32);
+		break;
+	case TEE_RPC_WAIT_QUEUE_SLEEP:
+	case TEE_RPC_WAIT_QUEUE_WAKEUP:
+		handle_rpc_func_cmd_wait_queue(ptee, arg32);
 		break;
 	case TEE_RPC_WAIT:
 		handle_rpc_func_cmd_wait(arg32);
@@ -477,7 +523,7 @@ static void set_params(struct tee_tz *ptee,
 		struct tee_data *data)
 {
 	size_t n;
-	struct tee_shm **shm;
+	struct tee_shm *shm;
 	TEEC_Value *value;
 
 	for (n = 0; n < TEEC_CONFIG_PAYLOAD_REF_COUNT; n++) {
@@ -492,10 +538,10 @@ static void set_params(struct tee_tz *ptee,
 			params32[n].u.value.b = value->b;
 			continue;
 		}
-		shm = (struct tee_shm **)&data->params[n];
+		shm = data->params[n].shm;
 		params32[n].attr |= get_cache_attrs(ptee);
-		params32[n].u.memref.buf_ptr = (*shm)->paddr;
-		params32[n].u.memref.size = (*shm)->size_req;
+		params32[n].u.memref.buf_ptr = shm->paddr;
+		params32[n].u.memref.size = shm->size_req;
 	}
 }
 
@@ -503,20 +549,20 @@ static void get_params(struct tee_data *data,
 		struct teesmc32_param params32[TEEC_CONFIG_PAYLOAD_REF_COUNT])
 {
 	size_t n;
-	struct tee_shm **shm;
+	struct tee_shm *shm;
 	TEEC_Value *value;
 
 	for (n = 0; n < TEEC_CONFIG_PAYLOAD_REF_COUNT; n++) {
 		if (params32[n].attr == TEESMC_ATTR_TYPE_NONE)
 			continue;
 		if (params32[n].attr < TEESMC_ATTR_TYPE_MEMREF_INPUT) {
-			value = (TEEC_Value *)&data->params[n];
+			value = &data->params[n].value;
 			value->a = params32[n].u.value.a;
 			value->b = params32[n].u.value.b;
 			continue;
 		}
-		shm = (struct tee_shm **)&data->params[n];
-		(*shm)->size_req = params32[n].u.memref.size;
+		shm = data->params[n].shm;
+		shm->size_req = params32[n].u.memref.size;
 	}
 }
 
@@ -1148,15 +1194,13 @@ static int tz_tee_init(struct platform_device *pdev)
 #endif
 #endif
 
-	tee->shm_flags = TEEC_MEM_INPUT | TEEC_MEM_OUTPUT;
-	tee->test = 0;
-
 	ptee->started = false;
 	ptee->sess_id = 0xAB000000;
 	mutex_init(&ptee->mutex);
 	init_completion(&ptee->c);
 	ptee->c_waiters = 0;
 
+	tee_wait_queue_init(&ptee->wait_queue);
 	ret = tee_mutex_wait_init(&ptee->mutex_wait);
 
 	if (ret)
@@ -1177,6 +1221,7 @@ static void tz_tee_deinit(struct platform_device *pdev)
 		return;
 
 	tee_mutex_wait_exit(&ptee->mutex_wait);
+	tee_wait_queue_exit(&ptee->wait_queue);
 
 	dev_dbg(tee->dev, "%s: dev=%s, Secure armv7 started=%d\n", __func__,
 		 tee->name, ptee->started);
@@ -1209,11 +1254,11 @@ static int tz_tee_probe(struct platform_device *pdev)
 
 	ret = tz_tee_init(pdev);
 	if (ret)
-		goto bail1;
+		goto bail0;
 
 	ret = tee_core_add(tee);
 	if (ret)
-		goto bail0;
+		goto bail1;
 
 #ifdef _TEE_DEBUG
 	pr_debug("- tee=%p, id=%d, iminor=%d\n", tee, tee->id,
@@ -1224,6 +1269,7 @@ static int tz_tee_probe(struct platform_device *pdev)
 bail1:
 	tz_tee_deinit(pdev);
 bail0:
+	tee_core_free(tee);
 	return ret;
 }
 

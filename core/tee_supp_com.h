@@ -28,13 +28,14 @@
 #define TEE_RPC_BUFFER		0x00000001
 #define TEE_RPC_VALUE		0x00000002
 #define TEE_RPC_LOAD_TA		0x10000001
-#define TEE_RPC_FREE_TA_WITH_FD	0x10000012
 /*
  * Handled within the driver only
  * Keep aligned with optee_os (secure space)
  */
-#define TEE_RPC_MUTEX_WAIT	0x20000000
-#define TEE_RPC_WAIT		0x30000000
+#define TEE_RPC_MUTEX_WAIT		0x20000000
+#define TEE_RPC_WAIT_QUEUE_SLEEP	0x20000001
+#define TEE_RPC_WAIT_QUEUE_WAKEUP	0x20000002
+#define TEE_RPC_WAIT			0x30000000
 
 /* Parameters for TEE_RPC_WAIT_MUTEX above */
 #define TEE_MUTEX_WAIT_SLEEP	0
